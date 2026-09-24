@@ -1,11 +1,20 @@
 import { defineStore } from 'pinia'
 
+// 当前操作成员 id 持久化在本地；被撤销/移除后服务端会返回 401，前端自动回到未登录态
+const MEMBER_KEY = 'family_member_id'
+
 async function api(path, method = 'GET', body) {
   const opt = { method, headers: { 'Content-Type': 'application/json' } }
+  const memberId = localStorage.getItem(MEMBER_KEY)
+  if (memberId) opt.headers['X-Member-Id'] = memberId
   if (body) opt.body = JSON.stringify(body)
   const r = await fetch('/api' + path, opt)
   const data = await r.json()
-  if (!r.ok) throw new Error(data.error || '请求失败')
+  if (!r.ok) {
+    const err = new Error(data.error || '请求失败')
+    err.status = r.status
+    throw err
+  }
   return data
 }
 
@@ -22,6 +31,10 @@ export const useHomeStore = defineStore('home', {
     alerts: [],
     quotas: [],
     quotaAlerts: [],
+    // 家庭共享
+    current: null,            // 当前操作成员（含各权限点 perms）；null=未登录/身份失效
+    members: [],
+    invitations: [],
     toast: null,
     timer: null,
     // 已通知过的定额告警身份签名（id → level:status）：
@@ -34,7 +47,10 @@ export const useHomeStore = defineStore('home', {
     onCount: (s) => s.devices.filter((d) => d.power_on).length,
     totalWatts: (s) => s.devices.reduce((sum, d) => sum + (d.power_on ? d.watts : 0), 0),
     // 待处理/处理中的定额告警，用于 Tab 角标
-    pendingQuotaAlerts: (s) => s.quotaAlerts.filter((a) => a.status === 'open' || a.status === 'handling')
+    pendingQuotaAlerts: (s) => s.quotaAlerts.filter((a) => a.status === 'open' || a.status === 'handling'),
+    activeMembers: (s) => s.members.filter((m) => m.active),
+    // 当前成员是否拥有某权限点；未登录一律 false
+    can: (s) => (perm) => !!s.current?.perms?.[perm]
   },
   actions: {
     async load() {
@@ -49,6 +65,11 @@ export const useHomeStore = defineStore('home', {
       this.alerts = d.alerts
       this.quotas = d.quotas || []
       this.quotaAlerts = d.quota_alerts || []
+      this.members = d.members || []
+      this.invitations = d.invitations || []
+      // 服务端判定身份失效（撤销/移除）时清除本地选择，回到加入/切换态
+      if (!d.current && localStorage.getItem(MEMBER_KEY)) this.switchMember(null)
+      this.current = d.current
       this.loaded = true
       this.notifyNewQuotaAlerts(firstLoad)
     },
@@ -99,30 +120,110 @@ export const useHomeStore = defineStore('home', {
     },
     clearToast() { this.toast = null },
 
+    // ===== 家庭共享：身份 / 邀请 / 成员 =====
+    switchMember(id) {
+      if (id) localStorage.setItem(MEMBER_KEY, String(id))
+      else localStorage.removeItem(MEMBER_KEY)
+      this.current = null
+    },
+    // 统一样板：401（授权被回收）时清身份并提示，403（角色不足）给明确提示
+    async callWithGuard(fn) {
+      try { return await fn() }
+      catch (e) {
+        if (e.status === 401) {
+          this.switchMember(null)
+          await this.load().catch(() => {})
+        }
+        this.toastMsg(e.message, 'warn')
+        return null
+      }
+    },
+    async createInvite(form) {
+      return this.callWithGuard(async () => {
+        await api('/invitations', 'POST', { role: form.role, note: form.note || '' })
+        await this.load()
+        this.toastMsg('邀请已创建，请把邀请码发给对方', 'success')
+        return true
+      })
+    },
+    async acceptInvite(code, name) {
+      // 加入前调用：不依赖当前身份
+      try {
+        const r = await api('/invitations/accept', 'POST', { code, name })
+        this.switchMember(r.member.id)
+        await this.load()
+        this.toastMsg(`欢迎加入家庭，当前角色：${this.current.role_label}`, 'success')
+        return true
+      } catch (e) { this.toastMsg(e.message, 'warn'); return false }
+    },
+    async revokeInvite(id) {
+      return this.callWithGuard(async () => {
+        await api(`/invitations/${id}/revoke`, 'POST')
+        await this.load()
+        this.toastMsg('邀请已撤销，对方授权即刻回收', 'success')
+        return true
+      })
+    },
+    async reopenInvite(id, role) {
+      return this.callWithGuard(async () => {
+        await api(`/invitations/${id}/reopen`, 'POST', { role })
+        await this.load()
+        this.toastMsg('邀请已重新生效', 'success')
+        return true
+      })
+    },
+    async changeMemberRole(id, role) {
+      return this.callWithGuard(async () => {
+        await api(`/members/${id}/role`, 'POST', { role })
+        await this.load()
+        this.toastMsg('成员角色已调整', 'success')
+        return true
+      })
+    },
+    async removeMember(id) {
+      return this.callWithGuard(async () => {
+        await api(`/members/${id}/remove`, 'POST')
+        await this.load()
+        this.toastMsg('成员已移除，授权即刻回收', 'success')
+        return true
+      })
+    },
+
     async addDevice(p) {
-      try { await api('/device', 'POST', p); await this.load(); this.toastMsg('已新增设备', 'success') }
-      catch (e) { this.toastMsg(e.message, 'warn') }
+      return this.callWithGuard(async () => {
+        await api('/device', 'POST', p); await this.load(); this.toastMsg('已新增设备', 'success'); return true
+      })
     },
     async removeDevice(id) {
-      await api('/device/' + id, 'DELETE'); await this.load()
+      const r = await this.callWithGuard(() => api('/device/' + id, 'DELETE'))
+      if (r) await this.load()
     },
     async toggleDevice(id) {
       try {
         const r = await api(`/device/${id}/toggle`, 'POST'); await this.load()
         return r.power_on
-      } catch (e) { this.toastMsg(e.message, 'warn') }
+      } catch (e) {
+        if (e.status === 401) { this.switchMember(null); await this.load().catch(() => {}) }
+        this.toastMsg(e.message, 'warn')
+      }
     },
     async updateDevice(id, patch) {
-      await api(`/device/${id}/update`, 'POST', patch); await this.load()
+      const r = await this.callWithGuard(() => api(`/device/${id}/update`, 'POST', patch))
+      if (r) await this.load()
     },
     async addScene(scene) {
-      const r = await api('/scene', 'POST', scene); await this.load(); this.toastMsg('场景已创建', 'success'); return r.id
+      return this.callWithGuard(async () => {
+        const r = await api('/scene', 'POST', scene); await this.load()
+        this.toastMsg('场景已创建', 'success'); return r.id
+      })
     },
     async deleteScene(id) {
-      await api('/scene/' + id, 'DELETE'); await this.load()
+      const r = await this.callWithGuard(() => api('/scene/' + id, 'DELETE'))
+      if (r) await this.load()
     },
     async toggleScene(id) {
-      await api(`/scene/${id}/toggle`, 'POST'); await this.load()
+      const r = await this.callWithGuard(() => api(`/scene/${id}/toggle`, 'POST'))
+      if (r) await this.load()
     },
     async runScene(id) {
       try {
@@ -134,13 +235,14 @@ export const useHomeStore = defineStore('home', {
           this.toastMsg(`场景已触发，成功执行 ${r.executed.length} 个动作`, 'success')
         return r
       } catch (e) {
+        if (e.status === 401) { this.switchMember(null); await this.load().catch(() => {}) }
         this.toastMsg(e.message, 'warn')
       }
     },
 
     // ===== 能耗定额闭环 =====
     async saveQuota(form) {
-      try {
+      return this.callWithGuard(async () => {
         if (form.id) {
           await api(`/quota/${form.id}/update`, 'POST', {
             limit_kwh: Number(form.limit_kwh), period: form.period,
@@ -159,25 +261,24 @@ export const useHomeStore = defineStore('home', {
         }
         await this.load()
         return true
-      } catch (e) { this.toastMsg(e.message, 'warn'); return false }
+      })
     },
     async toggleQuota(q) {
-      try {
-        await api(`/quota/${q.id}/update`, 'POST', { enabled: !q.enabled })
-        await this.load()
-      } catch (e) { this.toastMsg(e.message, 'warn') }
+      const r = await this.callWithGuard(() => api(`/quota/${q.id}/update`, 'POST', { enabled: !q.enabled }))
+      if (r) await this.load()
     },
     async removeQuota(id) {
-      await api('/quota/' + id, 'DELETE')
-      await this.load()
-      this.toastMsg('定额已删除', 'success')
+      const r = await this.callWithGuard(() => api('/quota/' + id, 'DELETE'))
+      if (r) { await this.load(); this.toastMsg('定额已删除', 'success') }
     },
     async handleQuotaAlert(id, patch) {
-      try {
+      const r = await this.callWithGuard(async () => {
         await api(`/quota-alert/${id}/handle`, 'POST', patch)
         await this.load()
         this.toastMsg('告警状态已更新', 'success')
-      } catch (e) { this.toastMsg(e.message, 'warn') }
+        return true
+      })
+      return r
     },
     async fetchAdjustments(quotaId = null) {
       const qs = quotaId ? `?quota_id=${quotaId}` : ''

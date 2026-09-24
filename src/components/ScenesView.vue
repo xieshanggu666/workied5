@@ -1,7 +1,10 @@
 <template>
   <div class="scenes">
+    <div v-if="store.current && !store.can('scene_run')" class="perm-note">
+      🔒 当前角色「{{ store.current.role_label }}」不能执行场景，也不能调整场景配置
+    </div>
     <div class="toolbar">
-      <button class="add" @click="showBuilder = !showBuilder">＋ 新建场景</button>
+      <button v-if="store.can('scene_create')" class="add" @click="showBuilder = !showBuilder">＋ 新建场景</button>
     </div>
 
     <!-- 场景构建器 -->
@@ -50,9 +53,9 @@
           <span v-if="!s.actions.length" class="noact">无动作</span>
         </div>
         <div class="btns">
-          <button class="run" :disabled="!s.enabled" @click="run(s)">▶ 触发</button>
-          <button class="ghost" @click="store.toggleScene(s.id)">{{ s.enabled?'停用':'启用' }}</button>
-          <button class="ghost del" @click="remove(s)">删除</button>
+          <button class="run" :disabled="!s.enabled || !store.can('scene_run')" @click="run(s)">▶ 触发</button>
+          <button v-if="store.can('scene_toggle')" class="ghost" @click="store.toggleScene(s.id)">{{ s.enabled?'停用':'启用' }}</button>
+          <button v-if="store.can('scene_delete')" class="ghost del" @click="remove(s)">删除</button>
         </div>
       </div>
       <div v-if="!store.scenes.length" class="none">暂无场景</div>
@@ -86,6 +89,7 @@ async function remove(s) {
 
 <style scoped>
 .scenes{display:flex;flex-direction:column;gap:12px;}
+.perm-note{background:#13233f;border:1px solid rgba(255,213,79,0.35);color:#ffd54f;border-radius:10px;padding:9px 14px;font-size:12px;}
 .toolbar button{font-family:inherit;background:linear-gradient(135deg,#43a047,#2e7d32);border:none;color:#fff;border-radius:8px;padding:9px 14px;font-size:13px;font-weight:600;cursor:pointer;}
 .builder{background:#0f1b38;border:1px solid rgba(120,160,220,0.16);border-radius:12px;padding:16px;display:flex;flex-direction:column;gap:10px;}
 .builder h4{margin:0;color:#fff;}

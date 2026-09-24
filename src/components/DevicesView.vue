@@ -1,15 +1,18 @@
 <template>
   <div class="devs">
+    <div v-if="store.current && !store.can('device_control')" class="perm-note">
+      🔒 当前角色「{{ store.current.role_label }}」对设备仅有查看权限，不能开关或修改设备
+    </div>
     <div class="toolbar">
       <div class="filter">
         <select v-model="fRoom"><option :value="0">全部房间</option><option v-for="r in store.rooms" :key="r.id" :value="r.id">{{ r.name }}</option></select>
         <select v-model="fType"><option :value="0">全部类型</option><option v-for="t in store.types" :key="t.id" :value="t.id">{{ t.name }}</option></select>
         <select v-model="fStatus"><option value="">全部状态</option><option value="online">在线</option><option value="error">异常</option></select>
       </div>
-      <button class="add" @click="showAdd = !showAdd">＋ 添加设备</button>
+      <button v-if="store.can('device_create')" class="add" @click="showAdd = !showAdd">＋ 添加设备</button>
     </div>
 
-    <form v-if="showAdd" class="add-form" @submit.prevent="submit">
+    <form v-if="showAdd && store.can('device_create')" class="add-form" @submit.prevent="submit">
       <input v-model="form.name" placeholder="设备名称，如 儿童房夜灯" required />
       <select v-model="form.type_id" required><option disabled value="">设备类型</option><option v-for="t in store.types" :key="t.id" :value="t.id">{{ t.icon }} {{ t.name }}</option></select>
       <select v-model="form.room_id" required><option disabled value="">所属房间</option><option v-for="r in store.rooms" :key="r.id" :value="r.id">{{ r.name }}</option></select>
@@ -27,16 +30,18 @@
           </div>
           <span class="badge" :class="d.status">{{ d.status==='online'?'在线':d.status==='error'?'异常':'离线' }}</span>
           <label class="switch">
-            <input type="checkbox" :checked="!!d.power_on" @change="store.toggleDevice(d.id)" :disabled="d.status==='error'"/>
+            <input type="checkbox" :checked="!!d.power_on"
+                   @change="store.toggleDevice(d.id)"
+                   :disabled="d.status==='error' || !store.can('device_control')"/>
             <span></span>
           </label>
-          <button class="mini-del" @click="remove(d)">✕</button>
+          <button v-if="store.can('device_delete')" class="mini-del" @click="remove(d)">✕</button>
         </div>
         <div class="d-meta">
           <span>🔋{{ d.battery }}%</span>
           <span>📶{{ d.signal }}</span>
           <span>⚡{{ d.watts }}W</span>
-          <input class="inline-edit" :value="d.watts" type="number" @change="store.updateDevice(d.id,{watts:+$event.target.value})" title="编辑功率(W)"/>
+          <input v-if="store.can('device_update')" class="inline-edit" :value="d.watts" type="number" @change="store.updateDevice(d.id,{watts:+$event.target.value})" title="编辑功率(W)"/>
         </div>
         <div class="meters">
           <div class="m"><i class="batt" :style="{width:Math.min(100,d.battery)+'%'}"></i></div>
@@ -74,6 +79,7 @@ async function remove(d) {
 
 <style scoped>
 .devs{display:flex;flex-direction:column;gap:12px;}
+.perm-note{background:#13233f;border:1px solid rgba(255,213,79,0.35);color:#ffd54f;border-radius:10px;padding:9px 14px;font-size:12px;}
 .toolbar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;}
 .filter{display:flex;gap:8px;}
 select,input,button{font-family:inherit;background:#13233f;border:1px solid rgba(120,160,220,0.2);color:#dbe4f3;border-radius:8px;padding:8px 10px;font-size:12px;}

@@ -47,11 +47,26 @@ CREATE TABLE IF NOT EXISTS device_logs (
   device_name TEXT NOT NULL,
   action TEXT NOT NULL,
   detail TEXT NOT NULL DEFAULT '',
-  time TEXT NOT NULL
+  time TEXT NOT NULL,
+  actor_id INTEGER,                 -- 操作人 family_members.id（系统自动事件为空）
+  actor_name TEXT NOT NULL DEFAULT '',  -- 操作人名称快照（成员停用后日志仍可辨认）
+  actor_role TEXT NOT NULL DEFAULT ''   -- 操作时角色快照
 );
 -- 能耗由 energy.js 维护：energy_records（分段明细，按 device_id 归属、含完整起止时间）
 -- + energy_segments（开启中设备的段首）。旧版 energy(设备名/房间/kwh/hour) 表自动迁移。
 `)
+
+// 迁移：旧版 device_logs 无操作人字段，共享管理上线后所有写操作需留痕到成员
+function migrateDeviceLogs() {
+  const cols = db.prepare('PRAGMA table_info(device_logs)').all().map((c) => c.name)
+  if (cols.includes('actor_name')) return
+  db.exec(`
+  ALTER TABLE device_logs ADD COLUMN actor_id INTEGER;
+  ALTER TABLE device_logs ADD COLUMN actor_name TEXT NOT NULL DEFAULT '';
+  ALTER TABLE device_logs ADD COLUMN actor_role TEXT NOT NULL DEFAULT '';
+  `)
+}
+migrateDeviceLogs()
 
 // 迁移：旧版 scene_actions 只有 device_key（名称），重建为 device_id 稳定关联。
 // 名称唯一命中的正常绑定；重名设备无法判定原引用究竟指向哪一台，一律置 NULL（保留名称快照，

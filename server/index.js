@@ -5,6 +5,11 @@ import {
   initQuota, evaluateAll, createQuota, updateQuota, deleteQuota,
   handleAlert, listQuotas, listAlerts, getAdjustments, activeAlertCount
 } from './quota.js'
+import {
+  initFamily, can, resolveActor, currentView, listMembers, listInvitations,
+  createInvitation, acceptInvitation, revokeInvitation, reopenInvitation,
+  removeMember, changeMemberRole, ROLE_LABEL
+} from './family.js'
 
 const app = express()
 app.use(express.json())
@@ -16,18 +21,43 @@ const now = () => new Date().toLocaleString('zh-CN')
 
 // 必须在 db.js 建表/播种完成后初始化能耗模块
 initEnergy(db)
-// 定额模块依赖分段表：预警/超标触发时通过回调写入日志时间线作为通知
+// 家庭共享：成员/邀请/角色（建户主、各角色演示成员与邀请）
+initFamily(db)
+// 定额模块依赖分段表：预警/超标触发时通过回调写入日志时间线作为通知（系统事件，无操作人）
 initQuota(db, (entry, timeStr) => {
   run('INSERT INTO device_logs (device_name,action,detail,time) VALUES (?,?,?,?)',
     entry.device, entry.action, entry.detail, timeStr || now())
 })
 
-// 追加日志
-function log(device, action, detail = '') {
-  run('INSERT INTO device_logs (device_name,action,detail,time) VALUES (?,?,?,?)', device, action, detail, now())
+// 追加日志；actor 为操作成员时携带操作人快照（id/名称/角色），系统事件留空
+function log(device, action, detail = '', actor = null) {
+  run('INSERT INTO device_logs (device_name,action,detail,time,actor_id,actor_name,actor_role) VALUES (?,?,?,?,?,?,?)',
+    device, action, detail, now(), actor?.id ?? null, actor?.name ?? '', actor?.role ?? '')
   // 保留最近 200 条
   const c = q1('SELECT COUNT(*) c FROM device_logs').c
   if (c > 200) db.exec('DELETE FROM device_logs WHERE id <= (SELECT MAX(id)-200 FROM device_logs)')
+}
+
+// 鉴权中间件：所有 /api 请求解析当前操作成员（请求头 X-Member-Id），挂到 req.actor
+app.use('/api', (req, res, next) => {
+  req.actor = resolveActor(req.header('x-member-id'))
+  next()
+})
+// 写操作统一要求已登录的有效成员；具体动作再经 guard 做角色分级。
+// 例外：接受邀请发生在加入家庭之前，凭有效邀请码即可调用，无需成员身份。
+// 注意：中间件挂载在 /api 下，内部 req.path 已去掉 /api 前缀
+const PUBLIC_POST = new Set(['/invitations/accept'])
+app.use('/api', (req, res, next) => {
+  if (req.method === 'GET' || req.method === 'HEAD') return next()
+  if (PUBLIC_POST.has(req.path)) return next()
+  if (!req.actor) return res.status(401).json({ error: '请先选择家庭成员后再操作' })
+  next()
+})
+// 角色权限守卫：guard('device_control') 要求当前成员角色达到该动作最低等级
+const guard = (action) => (req, res, next) => {
+  if (!can(req.actor, action))
+    return res.status(403).json({ error: `当前角色「${ROLE_LABEL[req.actor.role]}」无权执行此操作` })
+  next()
 }
 
 // ===== 状态聚合 =====
@@ -54,6 +84,9 @@ app.get('/api/state', (req, res) => {
     energy,
     quotas: listQuotas(),
     quota_alerts: listAlerts(),
+    members: listMembers(),
+    invitations: listInvitations(),
+    current: currentView(req.header('x-member-id')),
     alerts: computeAlerts(energy)
   })
 })
@@ -87,14 +120,14 @@ function computeAlerts(energy) {
 }
 
 // ===== 设备 =====
-app.post('/api/device', (req, res) => {
+app.post('/api/device', guard('device_create'), (req, res) => {
   const { name, type_id, room_id } = req.body
   if (!name || !type_id || !room_id) return res.status(400).json({ error: 'missing' })
   const r = run('INSERT INTO devices (name,type_id,room_id) VALUES (?,?,?)', name, type_id, room_id)
-  log(name, '新增设备', `房间 ${q1('SELECT name FROM rooms WHERE id=?', room_id).name}`)
+  log(name, '新增设备', `房间 ${q1('SELECT name FROM rooms WHERE id=?', room_id).name}`, req.actor)
   res.json({ ok: true, id: r.lastInsertRowid })
 })
-app.delete('/api/device/:id', (req, res) => {
+app.delete('/api/device/:id', guard('device_delete'), (req, res) => {
   const d = q1('SELECT * FROM devices WHERE id=?', req.params.id)
   if (!d) return res.status(404).json({ error: 'not found' })
   // 引用该设备的场景动作将随外键 ON DELETE SET NULL 置空（失效引用）
@@ -104,11 +137,11 @@ app.delete('/api/device/:id', (req, res) => {
   run('DELETE FROM devices WHERE id=?', d.id)
   // 结段产生的新记录先计入定额，再评估（设备定额保留并标记已删除，历史告警按快照留存）
   evaluateAll()
-  log(d.name, '删除设备', affected ? `${affected} 个场景动作失效` : '')
+  log(d.name, '删除设备', affected ? `${affected} 个场景动作失效` : '', req.actor)
   res.json({ ok: true, affected_actions: affected })
 })
 // 切换开关
-app.post('/api/device/:id/toggle', (req, res) => {
+app.post('/api/device/:id/toggle', guard('device_control'), (req, res) => {
   const d = q1('SELECT * FROM devices WHERE id=?', req.params.id)
   if (!d) return res.status(404).json({ error: 'not found' })
   if (d.status === 'error') return res.status(409).json({ error: '设备异常，无法操作' })
@@ -117,7 +150,7 @@ app.post('/api/device/:id/toggle', (req, res) => {
   // 开关即分段边界：关闭结落本段用电，开启打开新段
   reconcileDevice(d.id)
   evaluateAll()
-  log(d.name, on ? '开启' : '关闭')
+  log(d.name, on ? '开启' : '关闭', '', req.actor)
   res.json({ ok: true, power_on: on })
 })
 // 更新设备字段
@@ -125,6 +158,13 @@ app.post('/api/device/:id/update', (req, res) => {
   const d = q1('SELECT * FROM devices WHERE id=?', req.params.id)
   if (!d) return res.status(404).json({ error: 'not found' })
   const { name, room_id, watts, power_on } = req.body
+  // 同一接口承载两类操作：结构性变更（改名/换房/改功率）需管理员，
+  // 仅开关变化属设备控制，成员即可；访客全部拒绝
+  const structural = name != null || room_id != null || watts != null
+  if (structural && !can(req.actor, 'device_update'))
+    return res.status(403).json({ error: `当前角色「${ROLE_LABEL[req.actor.role]}」只能控制开关，不能修改设备配置` })
+  if (!structural && power_on != null && !can(req.actor, 'device_control'))
+    return res.status(403).json({ error: `当前角色「${ROLE_LABEL[req.actor.role]}」无权控制设备` })
   if (room_id != null && !q1('SELECT id FROM rooms WHERE id=?', room_id))
     return res.status(400).json({ error: '房间不存在' })
   if (watts != null && (!Number.isFinite(+watts) || +watts < 0 || +watts > 10000))
@@ -148,12 +188,12 @@ app.post('/api/device/:id/update', (req, res) => {
   if (nextRoom !== d.room_id) detail.push(`换到 ${q1('SELECT name FROM rooms WHERE id=?', nextRoom).name}`)
   if (nextWatts !== d.watts) detail.push(`功率 ${d.watts}W→${nextWatts}W`)
   if (nextOn !== d.power_on) detail.push(nextOn ? '已开启' : '已关闭')
-  log(nextName, '更新设备', detail.join('，'))
+  log(nextName, '更新设备', detail.join('，'), req.actor)
   res.json({ ok: true })
 })
 
 // ===== 场景 =====
-app.post('/api/scene', (req, res) => {
+app.post('/api/scene', guard('scene_create'), (req, res) => {
   const { name, actions } = req.body
   const list = Array.isArray(actions) ? actions : []
   for (const a of list) {
@@ -166,21 +206,26 @@ app.post('/api/scene', (req, res) => {
     const d = q1('SELECT name FROM devices WHERE id=?', a.device_id)
     act.run(r.lastInsertRowid, a.device_id, d.name, a.action, i)
   })
+  log(name || '新场景', '新建场景', `${list.length} 个动作`, req.actor)
   res.json({ ok: true, id: r.lastInsertRowid })
 })
-app.delete('/api/scene/:id', (req, res) => {
+app.delete('/api/scene/:id', guard('scene_delete'), (req, res) => {
   const s = q1('SELECT * FROM scenes WHERE id=?', req.params.id)
-  if (s) { run('DELETE FROM scenes WHERE id=?', s.id); run('DELETE FROM scene_actions WHERE scene_id=?', s.id) }
+  if (s) {
+    run('DELETE FROM scenes WHERE id=?', s.id); run('DELETE FROM scene_actions WHERE scene_id=?', s.id)
+    log(s.name, '删除场景', '', req.actor)
+  }
   res.json({ ok: true })
 })
-app.post('/api/scene/:id/toggle', (req, res) => {
+app.post('/api/scene/:id/toggle', guard('scene_toggle'), (req, res) => {
   const s = q1('SELECT * FROM scenes WHERE id=?', req.params.id)
   if (!s) return res.status(404).json({ error: 'not found' })
   run('UPDATE scenes SET enabled=? WHERE id=?', s.enabled ? 0 : 1, s.id)
+  log(s.name, s.enabled ? '停用场景' : '启用场景', '', req.actor)
   res.json({ ok: true, enabled: s.enabled ? 0 : 1 })
 })
 // 触发场景：按 device_id 逐条执行，成功/失败如实记录并返回
-app.post('/api/scene/:id/run', (req, res) => {
+app.post('/api/scene/:id/run', guard('scene_run'), (req, res) => {
   const s = q1('SELECT * FROM scenes WHERE id=?', req.params.id)
   if (!s) return res.status(404).json({ error: 'not found' })
   if (!s.enabled) return res.status(409).json({ error: '场景已停用，无法执行' })
@@ -198,12 +243,12 @@ app.post('/api/scene/:id/run', (req, res) => {
       const duplicate = a.key_match_count > 1
       const reason = duplicate ? '存在重名设备，待重新绑定' : '设备已删除'
       failed.push({ device: label, action: a.action, reason })
-      log(label, `场景「${s.name}」执行失败`, `${a.action}（${reason}）`)
+      log(label, `场景「${s.name}」执行失败`, `${a.action}（${reason}）`, req.actor)
       continue
     }
     if (a.dstatus !== 'online') {
       failed.push({ device: a.dname, action: a.action, reason: '设备离线/异常' })
-      log(a.dname, `场景「${s.name}」执行失败`, `${a.action}（设备离线/异常）`)
+      log(a.dname, `场景「${s.name}」执行失败`, `${a.action}（设备离线/异常）`, req.actor)
       continue
     }
     // 每个动作确定性地映射为开/关：关闭/关机/撤防→关，其余（开启/启动/布防/制冷/调光…）→开
@@ -211,7 +256,7 @@ app.post('/api/scene/:id/run', (req, res) => {
     run('UPDATE devices SET power_on=? WHERE id=?', on, a.did)
     reconcileDevice(a.did, batchAt)
     changed.add(a.did)
-    log(a.dname, `场景「${s.name}」执行`, a.action)
+    log(a.dname, `场景「${s.name}」执行`, a.action, req.actor)
     executed.push({ device: a.dname, action: a.action })
   }
   // 批量动作全部结段后统一评估一次：紧接着读取 /api/state 时定额用量与告警状态已是最新。
@@ -222,34 +267,36 @@ app.post('/api/scene/:id/run', (req, res) => {
 
 // ===== 能耗定额与超标预警闭环 =====
 // 额度配置（按房间/设备 × 日/周/月）；同一对象同一周期唯一
-app.post('/api/quota', (req, res) => {
+app.post('/api/quota', guard('quota_manage'), (req, res) => {
   try {
     const id = createQuota(req.body || {})
     log('定额', '新增定额',
-      `${req.body.scope === 'room' ? '房间' : '设备'}定额已配置，周期 ${req.body.period}，额度 ${Number(req.body.limit_kwh)}kWh`)
+      `${req.body.scope === 'room' ? '房间' : '设备'}定额已配置，周期 ${req.body.period}，额度 ${Number(req.body.limit_kwh)}kWh`,
+      req.actor)
     res.json({ ok: true, id })
   } catch (e) { res.status(400).json({ error: e.message }) }
 })
-app.post('/api/quota/:id/update', (req, res) => {
+app.post('/api/quota/:id/update', guard('quota_manage'), (req, res) => {
   try {
     const changes = updateQuota(Number(req.params.id), req.body || {})
     const q0 = q1('SELECT * FROM energy_quotas WHERE id=?', req.params.id)
     log('定额', '调整定额',
       `「${q0.target_name}」${changes.length ? changes.join('，') : '无变化'}` +
-      `${req.body.reason ? `；备注：${req.body.reason}` : ''}`)
+      `${req.body.reason ? `；备注：${req.body.reason}` : ''}`,
+      req.actor)
     res.json({ ok: true })
   } catch (e) { res.status(400).json({ error: e.message }) }
 })
-app.delete('/api/quota/:id', (req, res) => {
+app.delete('/api/quota/:id', guard('quota_manage'), (req, res) => {
   try {
     const q0 = q1('SELECT * FROM energy_quotas WHERE id=?', req.params.id)
     deleteQuota(Number(req.params.id), req.body?.reason || '')
-    if (q0) log('定额', '删除定额', `「${q0.target_name}」${q0.period} 定额已删除，未关闭告警自动解除`)
+    if (q0) log('定额', '删除定额', `「${q0.target_name}」${q0.period} 定额已删除，未关闭告警自动解除`, req.actor)
     res.json({ ok: true })
   } catch (e) { res.status(400).json({ error: e.message }) }
 })
-// 告警处理闭环：待处理 → 处理中 → 已处理/已忽略，可附处理备注
-app.post('/api/quota-alert/:id/handle', (req, res) => {
+// 告警处理闭环：待处理 → 处理中 → 已处理/已忽略，可附处理备注（成员及以上）
+app.post('/api/quota-alert/:id/handle', guard('quota_alert_handle'), (req, res) => {
   try {
     const { status, note } = req.body || {}
     const a0 = q1('SELECT * FROM quota_alerts WHERE id=?', req.params.id)
@@ -258,13 +305,78 @@ app.post('/api/quota-alert/:id/handle', (req, res) => {
     const label = { handling: '开始处理', resolved: '标记已处理', ignored: '忽略告警', open: a0.status === 'handling' ? '退回待处理' : '重新打开' }[status] || '更新状态'
     const periodLabel = { daily: '每日', weekly: '每周', monthly: '每月' }[a.period] || a.period
     log(`${a.scope === 'room' ? '房间' : '设备'}·${a.target_name}`, `定额告警·${label}`,
-      `${periodLabel}用量 ${a.used_kwh.toFixed(2)}/${a.limit_kwh}kWh` + (note ? `；备注：${note}` : ''))
+      `${periodLabel}用量 ${a.used_kwh.toFixed(2)}/${a.limit_kwh}kWh` + (note ? `；备注：${note}` : ''),
+      req.actor)
     res.json({ ok: true })
   } catch (e) { res.status(400).json({ error: e.message }) }
 })
 // 额度调整历史（不传 quota_id 时为全局最近 50 条）
 app.get('/api/quota-adjustments', (req, res) => {
   res.json(getAdjustments(req.query.quota_id ? Number(req.query.quota_id) : null))
+})
+
+// ===== 家庭共享：邀请 / 成员 / 角色权限 / 撤销状态 =====
+// 创建邀请（管理员及以上；不能邀请 owner）
+app.post('/api/invitations', guard('member_invite'), (req, res) => {
+  try {
+    const inv = createInvitation(req.body || {}, req.actor)
+    log('家庭共享', '创建邀请',
+      `邀请码 ${inv.code}，授予角色「${ROLE_LABEL[inv.role]}」${req.body.note ? `，备注：${req.body.note}` : ''}`,
+      req.actor)
+    res.json({ ok: true, invitation: inv })
+  } catch (e) { res.status(400).json({ error: e.message }) }
+})
+// 接受邀请（无需已有成员身份：凭码 + 成员名加入，成功即获得对应角色）
+app.post('/api/invitations/accept', (req, res) => {
+  try {
+    const { member, invite } = acceptInvitation(req.body?.code, req.body?.name)
+    // 加入本身以「新成员本人」名义留痕，协作闭环从加入第一步就可追溯
+    log('家庭共享', '接受邀请',
+      `「${member.name}」凭邀请码 ${invite.code} 加入家庭，角色「${ROLE_LABEL[member.role]}」`,
+      member)
+    res.json({ ok: true, member: { id: member.id, name: member.name, role: member.role } })
+  } catch (e) { res.status(400).json({ error: e.message }) }
+})
+// 撤销邀请：待接受邀请作废；已接受则同时停用成员，授权即时回收
+app.post('/api/invitations/:id/revoke', guard('invite_revoke'), (req, res) => {
+  try {
+    const { invite, member } = revokeInvitation(Number(req.params.id))
+    log('家庭共享', '撤销邀请',
+      `邀请码 ${invite.code} 已撤销` + (member ? `，成员「${member.name}」授权即刻回收` : '（尚未被接受）'),
+      req.actor)
+    res.json({ ok: true })
+  } catch (e) { res.status(400).json({ error: e.message }) }
+})
+// 重新邀请：已撤销邀请原地复活，原成员若存在则一并恢复（可回收的协作闭环）
+app.post('/api/invitations/:id/reopen', guard('invite_reopen'), (req, res) => {
+  try {
+    const { invite, member } = reopenInvitation(Number(req.params.id), req.body?.role)
+    log('家庭共享', '重新邀请',
+      `邀请码 ${invite.code} 重新生效` + (member ? `，成员「${member.name}」恢复角色「${ROLE_LABEL[member.role]}」` : '（等待新成员接受）'),
+      req.actor)
+    res.json({ ok: true })
+  } catch (e) { res.status(400).json({ error: e.message }) }
+})
+// 调整成员角色（仅户主；不能改户主自己）
+app.post('/api/members/:id/role', guard('member_role'), (req, res) => {
+  try {
+    const before = q1('SELECT * FROM family_members WHERE id=?', req.params.id)
+    const m = changeMemberRole(Number(req.params.id), req.body?.role, req.actor)
+    log('家庭共享', '调整角色',
+      `「${before.name}」角色 ${ROLE_LABEL[before.role]} → ${ROLE_LABEL[m.role]}`,
+      req.actor)
+    res.json({ ok: true })
+  } catch (e) { res.status(400).json({ error: e.message }) }
+})
+// 移除成员（管理员可移除 member/guest；移除 admin 须户主）：授权即时回收
+app.post('/api/members/:id/remove', guard('member_remove'), (req, res) => {
+  try {
+    const m = removeMember(Number(req.params.id), req.actor)
+    log('家庭共享', '移除成员',
+      `「${m.name}」（${ROLE_LABEL[m.prev_role]}）已被移除，授权即刻回收`,
+      req.actor)
+    res.json({ ok: true })
+  } catch (e) { res.status(400).json({ error: e.message }) }
 })
 
 // ===== 日志 =====

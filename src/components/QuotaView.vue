@@ -1,5 +1,8 @@
 <template>
   <div class="quota">
+    <div v-if="store.current && !store.can('quota_alert_handle')" class="perm-note">
+      🔒 当前角色「{{ store.current.role_label }}」仅可查看定额与告警，不能处理告警；配置额度需管理员
+    </div>
     <!-- KPI -->
     <div class="kpis">
       <div class="kpi"><b>{{ store.quotas.length }}</b><em>已配置定额</em></div>
@@ -12,7 +15,7 @@
     <div class="card">
       <div class="card-head">
         <h4>📏 周期能耗定额 · 按房间 / 设备配置</h4>
-        <button class="add" @click="openCreate">＋ 新建定额</button>
+        <button v-if="store.can('quota_manage')" class="add" @click="openCreate">＋ 新建定额</button>
       </div>
 
       <!-- 新建/编辑表单 -->
@@ -71,15 +74,19 @@
               </span>
             </td>
             <td>
-              <label class="switch">
+              <label v-if="store.can('quota_manage')" class="switch">
                 <input type="checkbox" :checked="q.enabled" @change="store.toggleQuota(q)"/>
                 <span></span>
               </label>
+              <span v-else class="dim">{{ q.enabled ? '启用中' : '已停用' }}</span>
             </td>
             <td class="ops">
-              <button @click="openEdit(q)">编辑</button>
-              <button @click="showHistory(q.id)">历史</button>
-              <button class="danger" @click="remove(q)">删除</button>
+              <template v-if="store.can('quota_manage')">
+                <button @click="openEdit(q)">编辑</button>
+                <button @click="showHistory(q.id)">历史</button>
+                <button class="danger" @click="remove(q)">删除</button>
+              </template>
+              <button v-else @click="showHistory(q.id)">历史</button>
             </td>
           </tr>
         </tbody>
@@ -116,19 +123,22 @@
             </td>
             <td class="dim">{{ fmtTime(a.created_at) }}</td>
             <td class="ops">
-              <template v-if="a.status==='open'">
-                <button class="go" @click="act(a,'handling')">开始处理</button>
-                <button class="ok-btn" @click="act(a,'resolved')">已处理</button>
-                <button @click="act(a,'ignored')">忽略</button>
+              <template v-if="store.can('quota_alert_handle')">
+                <template v-if="a.status==='open'">
+                  <button class="go" @click="act(a,'handling')">开始处理</button>
+                  <button class="ok-btn" @click="act(a,'resolved')">已处理</button>
+                  <button @click="act(a,'ignored')">忽略</button>
+                </template>
+                <template v-else-if="a.status==='handling'">
+                  <button class="ok-btn" @click="act(a,'resolved')">完成处理</button>
+                  <button @click="act(a,'open')">退回</button>
+                  <button @click="act(a,'ignored')">忽略</button>
+                </template>
+                <template v-else>
+                  <button @click="act(a,'open')">重新打开</button>
+                </template>
               </template>
-              <template v-else-if="a.status==='handling'">
-                <button class="ok-btn" @click="act(a,'resolved')">完成处理</button>
-                <button @click="act(a,'open')">退回</button>
-                <button @click="act(a,'ignored')">忽略</button>
-              </template>
-              <template v-else>
-                <button @click="act(a,'open')">重新打开</button>
-              </template>
+              <span v-else class="dim">无处理权限</span>
             </td>
           </tr>
         </tbody>
@@ -277,6 +287,7 @@ function changeText(h) {
 
 <style scoped>
 .quota{display:flex;flex-direction:column;gap:16px;}
+.perm-note{background:#13233f;border:1px solid rgba(255,213,79,0.35);color:#ffd54f;border-radius:10px;padding:9px 14px;font-size:12px;}
 .kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;}
 .kpi{background:#0f1b38;border:1px solid rgba(120,160,220,0.16);border-radius:12px;padding:16px;text-align:center;}
 .kpi b{display:block;font-size:28px;color:#ffd54f;}
