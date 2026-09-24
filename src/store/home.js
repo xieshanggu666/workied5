@@ -1,18 +1,34 @@
 import { defineStore } from 'pinia'
 
+// 演示环境身份：成员令牌持久化在 localStorage，所有写请求带 X-Home-Token；
+// 无令牌=浏览模式（只读），写操作由后端 401 拦截。
+const TOKEN_KEY = 'home_member_token'
+
 async function api(path, method = 'GET', body) {
   const opt = { method, headers: { 'Content-Type': 'application/json' } }
+  const tok = localStorage.getItem(TOKEN_KEY)
+  if (tok) opt.headers['X-Home-Token'] = tok
   if (body) opt.body = JSON.stringify(body)
   const r = await fetch('/api' + path, opt)
   const data = await r.json()
-  if (!r.ok) throw new Error(data.error || '请求失败')
+  if (!r.ok) {
+    const e = new Error(data.error || '请求失败')
+    e.status = r.status
+    e.noPerm = !!data.no_perm
+    e.perm = data.perm
+    throw e
+  }
   return data
 }
 
 export const useHomeStore = defineStore('home', {
   state: () => ({
     loaded: false,
-    tab: 'dash',
+    tab: 'family',
+    // 当前登录成员（null=未选择身份的浏览模式）
+    current: null,
+    // 家庭共享：角色定义/权限字典/成员列表/邀请列表
+    family: { roles: {}, permissions: {}, members: [], invites: [] },
     rooms: [],
     types: [],
     devices: [],
@@ -34,12 +50,21 @@ export const useHomeStore = defineStore('home', {
     onCount: (s) => s.devices.filter((d) => d.power_on).length,
     totalWatts: (s) => s.devices.reduce((sum, d) => sum + (d.power_on ? d.watts : 0), 0),
     // 待处理/处理中的定额告警，用于 Tab 角标
-    pendingQuotaAlerts: (s) => s.quotaAlerts.filter((a) => a.status === 'open' || a.status === 'handling')
+    pendingQuotaAlerts: (s) => s.quotaAlerts.filter((a) => a.status === 'open' || a.status === 'handling'),
+    activeMembers: (s) => s.family.members.filter((m) => m.status === 'active'),
+    pendingInvites: (s) => s.family.invites.filter((i) => i.status === 'pending'),
+    // 当前身份是否具备某权限（后端会再次强制校验，前端仅用于按钮置灰等交互）
+    can: (s) => (perm) => !!s.current && (s.current.effective_perms || []).includes(perm),
+    isManager: (s) => !!s.current && (s.current.effective_perms || []).includes('member_manage')
   },
   actions: {
     async load() {
       const d = await api('/state')
       const firstLoad = !this.loaded
+      this.current = d.current
+        ? { ...d.current, effective_perms: (d.family.members.find((m) => m.id === d.current.id) || {}).effective_perms || [] }
+        : null
+      this.family = d.family || { roles: {}, permissions: {}, members: [], invites: [] }
       this.rooms = d.rooms
       this.types = d.types
       this.devices = d.devices
@@ -104,7 +129,8 @@ export const useHomeStore = defineStore('home', {
       catch (e) { this.toastMsg(e.message, 'warn') }
     },
     async removeDevice(id) {
-      await api('/device/' + id, 'DELETE'); await this.load()
+      try { await api('/device/' + id, 'DELETE'); await this.load() }
+      catch (e) { this.toastMsg(e.message, 'warn'); throw e }
     },
     async toggleDevice(id) {
       try {
@@ -113,16 +139,22 @@ export const useHomeStore = defineStore('home', {
       } catch (e) { this.toastMsg(e.message, 'warn') }
     },
     async updateDevice(id, patch) {
-      await api(`/device/${id}/update`, 'POST', patch); await this.load()
+      try { await api(`/device/${id}/update`, 'POST', patch); await this.load() }
+      catch (e) { this.toastMsg(e.message, 'warn') }
     },
     async addScene(scene) {
-      const r = await api('/scene', 'POST', scene); await this.load(); this.toastMsg('场景已创建', 'success'); return r.id
+      try {
+        const r = await api('/scene', 'POST', scene); await this.load()
+        this.toastMsg('场景已创建', 'success'); return r.id
+      } catch (e) { this.toastMsg(e.message, 'warn') }
     },
     async deleteScene(id) {
-      await api('/scene/' + id, 'DELETE'); await this.load()
+      try { await api('/scene/' + id, 'DELETE'); await this.load() }
+      catch (e) { this.toastMsg(e.message, 'warn'); throw e }
     },
     async toggleScene(id) {
-      await api(`/scene/${id}/toggle`, 'POST'); await this.load()
+      try { await api(`/scene/${id}/toggle`, 'POST'); await this.load() }
+      catch (e) { this.toastMsg(e.message, 'warn') }
     },
     async runScene(id) {
       try {
@@ -168,9 +200,11 @@ export const useHomeStore = defineStore('home', {
       } catch (e) { this.toastMsg(e.message, 'warn') }
     },
     async removeQuota(id) {
-      await api('/quota/' + id, 'DELETE')
-      await this.load()
-      this.toastMsg('定额已删除', 'success')
+      try {
+        await api('/quota/' + id, 'DELETE')
+        await this.load()
+        this.toastMsg('定额已删除', 'success')
+      } catch (e) { this.toastMsg(e.message, 'warn') }
     },
     async handleQuotaAlert(id, patch) {
       try {
@@ -182,6 +216,84 @@ export const useHomeStore = defineStore('home', {
     async fetchAdjustments(quotaId = null) {
       const qs = quotaId ? `?quota_id=${quotaId}` : ''
       return await api('/quota-adjustments' + qs)
+    },
+
+    // ===== 家庭共享：身份 / 邀请 / 角色 / 撤销 =====
+    // 切换演示身份（选择在组成员的令牌）；传 null 回到只读浏览模式
+    async switchIdentity(member) {
+      if (member) {
+        localStorage.setItem(TOKEN_KEY, member.token)
+        await this.load()
+        this.toastMsg(`已切换为${member.role_label}「${member.name}」`, 'success')
+      } else {
+        localStorage.removeItem(TOKEN_KEY)
+        await this.load()
+        this.toastMsg('已进入只读浏览模式', 'info')
+      }
+    },
+    // 凭邀请码加入家庭，成功后自动以新成员身份登录
+    async acceptInvite(code) {
+      try {
+        const r = await api('/family/invite/accept', 'POST', { code })
+        localStorage.setItem(TOKEN_KEY, r.token)
+        await this.load()
+        this.toastMsg(`欢迎加入，${r.member.role_label}「${r.member.name}」`, 'success')
+        return true
+      } catch (e) { this.toastMsg(e.message, 'warn'); return false }
+    },
+    async previewInvite(code) {
+      return await api('/family/invite-preview?code=' + encodeURIComponent(code))
+    },
+    async createInvite(form) {
+      try {
+        const r = await api('/family/invite', 'POST', form)
+        await this.load()
+        this.toastMsg(`邀请已发出，邀请码 ${r.invite.code}`, 'success')
+        return r.invite
+      } catch (e) { this.toastMsg(e.message, 'warn'); return null }
+    },
+    async cancelInvite(id, reason = '') {
+      try { await api(`/family/invite/${id}/cancel`, 'POST', { reason }); await this.load() }
+      catch (e) { this.toastMsg(e.message, 'warn') }
+    },
+    async resendInvite(id) {
+      try {
+        const r = await api(`/family/invite/${id}/resend`, 'POST')
+        await this.load()
+        this.toastMsg(`新邀请码 ${r.code}`, 'success')
+        return r.code
+      } catch (e) { this.toastMsg(e.message, 'warn') }
+    },
+    async updateMember(id, patch) {
+      try {
+        await api(`/family/member/${id}/update`, 'POST', patch)
+        await this.load()
+        this.toastMsg('成员角色/权限已更新并即时生效', 'success')
+        return true
+      } catch (e) { this.toastMsg(e.message, 'warn'); return false }
+    },
+    async revokeMember(id, reason = '') {
+      try {
+        await api(`/family/member/${id}/revoke`, 'POST', { reason })
+        // 撤销的若是当前身份，令牌已失效，回到浏览模式
+        if (this.current && this.current.id === id) {
+          localStorage.removeItem(TOKEN_KEY)
+          this.toastMsg('当前身份已被撤销，回到浏览模式', 'warn')
+        }
+        await this.load()
+        return true
+      } catch (e) { this.toastMsg(e.message, 'warn'); return false }
+    },
+    async restoreMember(id) {
+      try { await api(`/family/member/${id}/restore`, 'POST'); await this.load(); this.toastMsg('成员已恢复并签发新令牌', 'success') }
+      catch (e) { this.toastMsg(e.message, 'warn') }
+    },
+    async reinviteMember(id) {
+      try {
+        const r = await api(`/family/member/${id}/reinvite`, 'POST')
+        await this.load()
+        if (r) this.toastMsg(`已重新邀请，邀请码 ${r.invite.code}`, 'success')
+      } catch (e) { this.toastMsg(e.message, 'warn') }
     }
   }
 })

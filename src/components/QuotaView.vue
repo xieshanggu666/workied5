@@ -1,5 +1,7 @@
 <template>
   <div class="quota">
+    <div v-if="!store.current" class="lock-banner">🔒 浏览模式：加入家庭后可处理定额告警（家庭成员及以上），定额配置需管理权限。</div>
+    <div v-else-if="!canAlert && !canManage" class="lock-banner">🔒 当前角色没有定额相关操作权限，仅可查看定额执行与告警。</div>
     <!-- KPI -->
     <div class="kpis">
       <div class="kpi"><b>{{ store.quotas.length }}</b><em>已配置定额</em></div>
@@ -12,7 +14,7 @@
     <div class="card">
       <div class="card-head">
         <h4>📏 周期能耗定额 · 按房间 / 设备配置</h4>
-        <button class="add" @click="openCreate">＋ 新建定额</button>
+        <button class="add" :disabled="!canManage" :title="canManage?'':'无定额配置管理权限'" @click="canManage && openCreate()">＋ 新建定额</button>
       </div>
 
       <!-- 新建/编辑表单 -->
@@ -71,15 +73,15 @@
               </span>
             </td>
             <td>
-              <label class="switch">
-                <input type="checkbox" :checked="q.enabled" @change="store.toggleQuota(q)"/>
+              <label class="switch" :class="{locked:!canManage}">
+                <input type="checkbox" :checked="q.enabled" :disabled="!canManage" @change="store.toggleQuota(q)"/>
                 <span></span>
               </label>
             </td>
             <td class="ops">
-              <button @click="openEdit(q)">编辑</button>
+              <button v-if="canManage" @click="openEdit(q)">编辑</button>
               <button @click="showHistory(q.id)">历史</button>
-              <button class="danger" @click="remove(q)">删除</button>
+              <button v-if="canManage" class="danger" @click="remove(q)">删除</button>
             </td>
           </tr>
         </tbody>
@@ -116,19 +118,22 @@
             </td>
             <td class="dim">{{ fmtTime(a.created_at) }}</td>
             <td class="ops">
-              <template v-if="a.status==='open'">
-                <button class="go" @click="act(a,'handling')">开始处理</button>
-                <button class="ok-btn" @click="act(a,'resolved')">已处理</button>
-                <button @click="act(a,'ignored')">忽略</button>
+              <template v-if="canAlert">
+                <template v-if="a.status==='open'">
+                  <button class="go" @click="act(a,'handling')">开始处理</button>
+                  <button class="ok-btn" @click="act(a,'resolved')">已处理</button>
+                  <button @click="act(a,'ignored')">忽略</button>
+                </template>
+                <template v-else-if="a.status==='handling'">
+                  <button class="ok-btn" @click="act(a,'resolved')">完成处理</button>
+                  <button @click="act(a,'open')">退回</button>
+                  <button @click="act(a,'ignored')">忽略</button>
+                </template>
+                <template v-else>
+                  <button @click="act(a,'open')">重新打开</button>
+                </template>
               </template>
-              <template v-else-if="a.status==='handling'">
-                <button class="ok-btn" @click="act(a,'resolved')">完成处理</button>
-                <button @click="act(a,'open')">退回</button>
-                <button @click="act(a,'ignored')">忽略</button>
-              </template>
-              <template v-else>
-                <button @click="act(a,'open')">重新打开</button>
-              </template>
+              <span v-else class="dim">无处理权限</span>
             </td>
           </tr>
         </tbody>
@@ -170,6 +175,8 @@
 import { ref, computed, onMounted, watch } from 'vue'
 import { useHomeStore } from '@/store/home'
 const store = useHomeStore()
+const canAlert = computed(() => store.can('quota_alert_handle'))
+const canManage = computed(() => store.can('quota_manage'))
 
 const formShow = ref(false)
 const form = ref(emptyForm())
@@ -277,6 +284,8 @@ function changeText(h) {
 
 <style scoped>
 .quota{display:flex;flex-direction:column;gap:16px;}
+.lock-banner{background:#3a2f12;border:1px solid rgba(255,213,79,.35);color:#ffd54f;font-size:12px;border-radius:10px;padding:9px 14px;}
+.switch.locked{opacity:.45;pointer-events:none;}
 .kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;}
 .kpi{background:#0f1b38;border:1px solid rgba(120,160,220,0.16);border-radius:12px;padding:16px;text-align:center;}
 .kpi b{display:block;font-size:28px;color:#ffd54f;}

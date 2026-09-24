@@ -1,7 +1,9 @@
 <template>
   <div class="scenes">
+    <div v-if="!store.current" class="lock-banner">🔒 浏览模式：访客/成员加入家庭后可触发场景，场景编排需「场景管理」权限。</div>
+    <div v-else-if="!canRun" class="lock-banner">🔒 当前角色没有场景执行权限，仅可查看场景。</div>
     <div class="toolbar">
-      <button class="add" @click="showBuilder = !showBuilder">＋ 新建场景</button>
+      <button class="add" :disabled="!canManage" :title="canManage?'':'无场景管理权限'" @click="canManage && (showBuilder = !showBuilder)">＋ 新建场景</button>
     </div>
 
     <!-- 场景构建器 -->
@@ -50,9 +52,9 @@
           <span v-if="!s.actions.length" class="noact">无动作</span>
         </div>
         <div class="btns">
-          <button class="run" :disabled="!s.enabled" @click="run(s)">▶ 触发</button>
-          <button class="ghost" @click="store.toggleScene(s.id)">{{ s.enabled?'停用':'启用' }}</button>
-          <button class="ghost del" @click="remove(s)">删除</button>
+          <button class="run" :disabled="!s.enabled || !canRun" :title="canRun?'':'无场景执行权限'" @click="canRun && run(s)">▶ 触发</button>
+          <button v-if="canManage" class="ghost" @click="store.toggleScene(s.id)">{{ s.enabled?'停用':'启用' }}</button>
+          <button v-if="canManage" class="ghost del" @click="remove(s)">删除</button>
         </div>
       </div>
       <div v-if="!store.scenes.length" class="none">暂无场景</div>
@@ -61,9 +63,11 @@
 </template>
 
 <script setup>
-import { ref } from 'vue'
+import { ref, computed } from 'vue'
 import { useHomeStore } from '@/store/home'
 const store = useHomeStore()
+const canRun = computed(() => store.can('scene_execute'))
+const canManage = computed(() => store.can('scene_manage'))
 const showBuilder = ref(false)
 const sceneForm = ref({ name: '', actions: [] })
 const lastResult = ref(null)
@@ -86,6 +90,7 @@ async function remove(s) {
 
 <style scoped>
 .scenes{display:flex;flex-direction:column;gap:12px;}
+.lock-banner{background:#3a2f12;border:1px solid rgba(255,213,79,.35);color:#ffd54f;font-size:12px;border-radius:10px;padding:9px 14px;}
 .toolbar button{font-family:inherit;background:linear-gradient(135deg,#43a047,#2e7d32);border:none;color:#fff;border-radius:8px;padding:9px 14px;font-size:13px;font-weight:600;cursor:pointer;}
 .builder{background:#0f1b38;border:1px solid rgba(120,160,220,0.16);border-radius:12px;padding:16px;display:flex;flex-direction:column;gap:10px;}
 .builder h4{margin:0;color:#fff;}
